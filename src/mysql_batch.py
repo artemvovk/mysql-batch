@@ -33,13 +33,12 @@ def execute(
     """
     Execute batch update or delete operations in parallel using a temporary table
     """
-    global confirmed_write, connection
+    global connection
 
     if action == 'update' and set_ is None:
         raise RuntimeError('Error: argument -s/--set is required for updates.')
 
     connection = connect(host, user, port, password, database)
-    confirmed_write = no_confirm
 
     try:
         with connection.cursor() as cursor:
@@ -51,7 +50,7 @@ def execute(
 
             # Get total count of records to process
             cursor.execute("SELECT COUNT(*) FROM temp_batch_keys")
-            total_count = cursor.fetchone()[0]  # Changed to access tuple by index
+            total_count = cursor.fetchone()[0]
 
             if total_count == 0:
                 print("* No rows to modify!")
@@ -94,22 +93,38 @@ def create_temp_table(cursor, primary_key: str):
     """)
 
 def populate_temp_table(cursor, table: str, where: str, primary_key: str, batch_size: int):
-    """Populate temporary table with all matching primary keys"""
+    """Populate temporary table with all matching primary keys using LIMIT-based pagination"""
     print("* Populating temporary table with primary keys...")
-    cursor.execute(f"""
-        INSERT INTO temp_batch_keys ({primary_key})
-        SELECT {primary_key} FROM {table}
-        WHERE {where} LIMIT {batch_size}
-    """)
-    connection.commit()
+
+    offset = 0
+    total_inserted = 0
+
+    while True:
+        # Insert a batch of records using LIMIT/OFFSET
+        cursor.execute(f"""
+            INSERT INTO temp_batch_keys ({primary_key})
+            SELECT {primary_key}
+            FROM {table}
+            WHERE {where}
+            LIMIT {batch_size}
+            OFFSET {offset}
+        """)
+
+        rows_inserted = cursor.rowcount
+        if rows_inserted == 0:
+            break
+
+        total_inserted += rows_inserted
+        print(f"* Inserted batch: {rows_inserted} rows (Total: {total_inserted})")
+
+        connection.commit()
+        offset += batch_size
 
 def get_next_batch(cursor, primary_key: str, batch_size: int, worker_id: int) -> List[int]:
     """Get next batch of unprocessed IDs using MySQL-compatible approach"""
-    # Start a transaction
     cursor.execute("START TRANSACTION")
 
     try:
-        # Select and mark rows in one transaction
         cursor.execute(f"""
             SELECT {primary_key}
             FROM temp_batch_keys
@@ -122,10 +137,8 @@ def get_next_batch(cursor, primary_key: str, batch_size: int, worker_id: int) ->
             cursor.execute("COMMIT")
             return []
 
-        # Changed to access tuple by index (0)
         ids = [row[0] for row in rows]
 
-        # Mark these rows as claimed by this worker
         id_list = ','.join(map(str, ids))
         cursor.execute(f"""
             UPDATE temp_batch_keys
@@ -133,12 +146,10 @@ def get_next_batch(cursor, primary_key: str, batch_size: int, worker_id: int) ->
             WHERE {primary_key} IN ({id_list})
         """)
 
-        # Commit the transaction
         cursor.execute("COMMIT")
         return ids
 
     except Exception as e:
-        # Rollback on error
         cursor.execute("ROLLBACK")
         print(f"Error in get_next_batch: {e}")
         return []
@@ -156,7 +167,6 @@ def process_parallel_batches(
     """Process batches in parallel using ThreadPoolExecutor"""
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         while True:
-            # Get multiple batches for parallel processing
             batches = []
             for worker_id in range(max_workers):
                 batch = get_next_batch(cursor, primary_key, batch_size, worker_id)
@@ -167,7 +177,6 @@ def process_parallel_batches(
             if not batches:
                 break
 
-            # Submit batch jobs
             futures = []
             for batch, worker_id in batches:
                 if action == 'delete':
@@ -176,7 +185,6 @@ def process_parallel_batches(
                     future = executor.submit(update_batch, batch, table, set_, sleep, primary_key, worker_id)
                 futures.append(future)
 
-            # Wait for all batches to complete
             for future in futures:
                 try:
                     future.result()
@@ -185,7 +193,7 @@ def process_parallel_batches(
 
 def delete_batch(ids: List[int], table: str, sleep: float, primary_key: str, worker_id: int):
     """Execute delete batch"""
-    global connection, confirmed_write
+    global connection
 
     print(f"Worker {worker_id}: Deleting batch of {len(ids)} records")
 
@@ -199,7 +207,7 @@ def delete_batch(ids: List[int], table: str, sleep: float, primary_key: str, wor
 
 def update_batch(ids: List[int], table: str, set_: str, sleep: float, primary_key: str, worker_id: int):
     """Execute update batch"""
-    global connection, confirmed_write
+    global connection
 
     print(f"Worker {worker_id}: Updating batch of {len(ids)} records")
 
@@ -210,21 +218,6 @@ def update_batch(ids: List[int], table: str, set_: str, sleep: float, primary_ke
 
         if sleep > 0:
             time.sleep(sleep)
-
-def confirm_write(sql: str):
-    """Prompt for confirmation before executing write operations"""
-    global confirmed_write
-
-    print("\nAbout to execute:")
-    print(sql)
-    response = input("\nDo you want to proceed? [y/N] ")
-
-    if response.lower() != 'y':
-        print("Aborting...")
-        sys.exit()
-
-    confirmed_write = True
-
 def run_query(sql, sleep=0):
     """Execute a write query"""
 
