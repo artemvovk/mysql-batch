@@ -95,30 +95,21 @@ def create_temp_table(cursor, primary_key: str):
 def populate_temp_table(cursor, table: str, where: str, primary_key: str, batch_size: int):
     """Populate temporary table with all matching primary keys using LIMIT-based pagination"""
     print("* Populating temporary table with primary keys...")
+    # Insert a batch of records using LIMIT/OFFSET
+    cursor.execute(f"""
+        INSERT INTO temp_batch_keys ({primary_key})
+        SELECT {primary_key}
+        FROM {table}
+        WHERE {where}
+        LIMIT {batch_size}
+    """)
 
-    offset = 0
-    total_inserted = 0
+    rows_inserted = cursor.rowcount
 
-    while True:
-        # Insert a batch of records using LIMIT/OFFSET
-        cursor.execute(f"""
-            INSERT INTO temp_batch_keys ({primary_key})
-            SELECT {primary_key}
-            FROM {table}
-            WHERE {where}
-            LIMIT {batch_size}
-            OFFSET {offset}
-        """)
+    total_inserted += rows_inserted
+    print(f"* Inserted batch: {rows_inserted} rows (Total: {total_inserted})")
 
-        rows_inserted = cursor.rowcount
-        if rows_inserted == 0 or total_inserted >= 100000000:
-            break
-
-        total_inserted += rows_inserted
-        print(f"* Inserted batch: {rows_inserted} rows (Total: {total_inserted})")
-
-        connection.commit()
-        offset += batch_size
+    connection.commit()
 
 def get_next_batch(cursor, primary_key: str, batch_size: int, worker_id: int) -> List[int]:
     """Get next batch of unprocessed IDs using MySQL-compatible approach"""
