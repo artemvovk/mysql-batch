@@ -261,7 +261,7 @@ def populate_temp_table(cursor, table: str, where: str, primary_key: str, batch_
     cursor.execute(f"""
         INSERT INTO temp_batch_keys ({primary_key})
         SELECT {primary_key} FROM {table}
-        WHERE {where}
+        WHERE {where} LIMIT {batch_size}
     """)
 
 def get_next_batch(cursor, primary_key: str, batch_size: int) -> List[int]:
