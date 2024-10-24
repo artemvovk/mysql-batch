@@ -13,6 +13,176 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
+def execute(
+    host: str,
+    user: str,
+    port: int,
+    password: str,
+    database: str,
+    action: str,
+    table: str,
+    where: str,
+    set_: Optional[str] = None,
+    no_confirm: bool = False,
+    primary_key: str = 'id',
+    read_batch_size: int = 10000,
+    write_batch_size: int = 50,
+    sleep: float = 0,
+    max_workers: int = 4
+):
+    """
+    Execute batch update or delete operations in parallel using a temporary table
+    """
+    global confirmed_write, connection
+
+    if action == 'update' and set_ is None:
+        raise RuntimeError('Error: argument -s/--set is required for updates.')
+
+    connection = connect(host, user, port, password, database)
+    confirmed_write = no_confirm
+
+    try:
+        with connection.cursor() as cursor:
+            # Create temporary table
+            create_temp_table(cursor, primary_key)
+
+            # Populate temporary table with all matching primary keys
+            populate_temp_table(cursor, table, where, primary_key, read_batch_size)
+
+            # Get total count of records to process
+            cursor.execute("SELECT COUNT(*) FROM temp_batch_keys")
+            total_count = cursor.fetchone()[0]  # Changed to access tuple by index
+
+            if total_count == 0:
+                print("* No rows to modify!")
+                return True
+
+            print(f"* Found {total_count} rows to process")
+
+            # Process in parallel batches
+            process_parallel_batches(
+                cursor,
+                action,
+                table,
+                set_,
+                primary_key,
+                write_batch_size,
+                sleep,
+                max_workers
+            )
+
+    except SystemExit:
+        print("* Program exited")
+    finally:
+        # Drop temporary table
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TEMPORARY TABLE IF EXISTS temp_batch_keys")
+        connection.close()
+
+    return True
+
+def create_temp_table(cursor, primary_key: str):
+    """Create temporary table for storing primary keys"""
+    print("* Creating temporary table...")
+    cursor.execute(f"""
+        CREATE TEMPORARY TABLE temp_batch_keys (
+            {primary_key} bigint PRIMARY KEY,
+            processed boolean DEFAULT false,
+            worker_id int DEFAULT NULL,
+            INDEX (processed, worker_id)
+        )
+    """)
+
+def populate_temp_table(cursor, table: str, where: str, primary_key: str, batch_size: int):
+    """Populate temporary table with all matching primary keys"""
+    print("* Populating temporary table with primary keys...")
+    cursor.execute(f"""
+        INSERT INTO temp_batch_keys ({primary_key})
+        SELECT {primary_key} FROM {table}
+        WHERE {where}
+    """)
+    connection.commit()
+
+def get_next_batch(cursor, primary_key: str, batch_size: int, worker_id: int) -> List[int]:
+    """Get next batch of unprocessed IDs using MySQL-compatible approach"""
+    # Start a transaction
+    cursor.execute("START TRANSACTION")
+
+    try:
+        # Select and mark rows in one transaction
+        cursor.execute(f"""
+            SELECT {primary_key}
+            FROM temp_batch_keys
+            WHERE processed = false AND worker_id IS NULL
+            LIMIT {batch_size}
+        """)
+        rows = cursor.fetchall()
+
+        if not rows:
+            cursor.execute("COMMIT")
+            return []
+
+        # Changed to access tuple by index (0)
+        ids = [row[0] for row in rows]
+
+        # Mark these rows as claimed by this worker
+        id_list = ','.join(map(str, ids))
+        cursor.execute(f"""
+            UPDATE temp_batch_keys
+            SET processed = true, worker_id = {worker_id}
+            WHERE {primary_key} IN ({id_list})
+        """)
+
+        # Commit the transaction
+        cursor.execute("COMMIT")
+        return ids
+
+    except Exception as e:
+        # Rollback on error
+        cursor.execute("ROLLBACK")
+        print(f"Error in get_next_batch: {e}")
+        return []
+
+def process_parallel_batches(
+    cursor,
+    action: str,
+    table: str,
+    set_: Optional[str],
+    primary_key: str,
+    batch_size: int,
+    sleep: float,
+    max_workers: int
+):
+    """Process batches in parallel using ThreadPoolExecutor"""
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while True:
+            # Get multiple batches for parallel processing
+            batches = []
+            for worker_id in range(max_workers):
+                batch = get_next_batch(cursor, primary_key, batch_size, worker_id)
+                if not batch:
+                    break
+                batches.append((batch, worker_id))
+
+            if not batches:
+                break
+
+            # Submit batch jobs
+            futures = []
+            for batch, worker_id in batches:
+                if action == 'delete':
+                    future = executor.submit(delete_batch, batch, table, sleep, primary_key, worker_id)
+                else:
+                    future = executor.submit(update_batch, batch, table, set_, sleep, primary_key, worker_id)
+                futures.append(future)
+
+            # Wait for all batches to complete
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error processing batch: {e}")
+
 def delete_batch(ids: List[int], table: str, sleep: float, primary_key: str, worker_id: int):
     """Execute delete batch"""
     global connection, confirmed_write
@@ -21,6 +191,8 @@ def delete_batch(ids: List[int], table: str, sleep: float, primary_key: str, wor
 
     with connection.cursor() as cursor:
         sql = f"DELETE FROM {table} WHERE {primary_key} IN ({','.join(map(str, ids))})"
+        if not confirmed_write:
+            confirm_write(sql)
         cursor.execute(sql)
         connection.commit()
 
@@ -35,12 +207,27 @@ def update_batch(ids: List[int], table: str, set_: str, sleep: float, primary_ke
 
     with connection.cursor() as cursor:
         sql = f"UPDATE {table} SET {set_} WHERE {primary_key} IN ({','.join(map(str, ids))})"
+        if not confirmed_write:
+            confirm_write(sql)
         cursor.execute(sql)
         connection.commit()
 
         if sleep > 0:
             time.sleep(sleep)
 
+def confirm_write(sql: str):
+    """Prompt for confirmation before executing write operations"""
+    global confirmed_write
+
+    print("\nAbout to execute:")
+    print(sql)
+    response = input("\nDo you want to proceed? [y/N] ")
+
+    if response.lower() != 'y':
+        print("Aborting...")
+        sys.exit()
+
+    confirmed_write = True
 
 def run_query(sql, sleep=0):
     """Execute a write query"""
@@ -127,193 +314,6 @@ def connect(host, user, port, password, database):
                                client_flag=pymysql.constants.CLIENT.MULTI_STATEMENTS)
     except Exception:
         raise RuntimeError('Error: MySQL connection failed.')
-
-
-def execute(
-    host: str,
-    user: str,
-    port: int,
-    password: str,
-    database: str,
-    action: str,
-    table: str,
-    where: str,
-    set_: Optional[str] = None,
-    no_confirm: bool = False,
-    primary_key: str = 'id',
-    read_batch_size: int = 10000,
-    write_batch_size: int = 50,
-    sleep: float = 0,
-    max_workers: int = 4
-):
-    """
-    Execute batch update or delete operations in parallel using a temporary table
-
-    Args:
-        host: Database host
-        user: Database user
-        port: Database port
-        password: Database password
-        database: Database name
-        action: Either 'update' or 'delete'
-        table: Table to modify
-        where: WHERE clause for selecting records
-        set_: SET clause for updates
-        no_confirm: Skip confirmation prompt
-        primary_key: Primary key column name
-        read_batch_size: Number of records to read at once
-        write_batch_size: Number of records to write in each batch
-        sleep: Sleep time between batches
-        max_workers: Maximum number of parallel workers
-    """
-    global confirmed_write, connection
-
-    if action == 'update' and set_ is None:
-        raise RuntimeError('Error: argument -s/--set is required for updates.')
-
-    connection = connect(host, user, port, password, database)
-    confirmed_write = no_confirm
-
-    try:
-        with connection.cursor() as cursor:
-            # Create temporary table
-            create_temp_table(cursor, primary_key)
-
-            # Populate temporary table with all matching primary keys
-            populate_temp_table(cursor, table, where, primary_key, read_batch_size)
-
-            # Get total count of records to process
-            cursor.execute("SELECT COUNT(*) as count FROM temp_batch_keys")
-            total_count = cursor.fetchone()['count']
-
-            if total_count == 0:
-                print("* No rows to modify!")
-                return True
-
-            print(f"* Found {total_count} rows to process")
-
-            # Process in parallel batches
-            process_parallel_batches(
-                cursor,
-                action,
-                table,
-                set_,
-                primary_key,
-                write_batch_size,
-                sleep,
-                max_workers
-            )
-
-    except SystemExit:
-        print("* Program exited")
-    finally:
-        # Drop temporary table
-        with connection.cursor() as cursor:
-            cursor.execute("DROP TEMPORARY TABLE IF EXISTS temp_batch_keys")
-        connection.close()
-
-    return True
-
-def create_temp_table(cursor, primary_key: str):
-    """Create temporary table for storing primary keys"""
-    print("* Creating temporary table...")
-    cursor.execute(f"""
-        CREATE TEMPORARY TABLE temp_batch_keys (
-            {primary_key} bigint PRIMARY KEY,
-            processed boolean DEFAULT false,
-            worker_id int DEFAULT NULL,
-            INDEX (processed, worker_id)
-        )
-    """)
-
-def populate_temp_table(cursor, table: str, where: str, primary_key: str, batch_size: int):
-    """Populate temporary table with all matching primary keys"""
-    print("* Populating temporary table with primary keys...")
-    cursor.execute(f"""
-        INSERT INTO temp_batch_keys ({primary_key})
-        SELECT {primary_key} FROM {table}
-        WHERE {where} LIMIT {batch_size}
-    """)
-    connection.commit()
-
-def get_next_batch(cursor, primary_key: str, batch_size: int, worker_id: int) -> List[int]:
-    """Get next batch of unprocessed IDs using MySQL-compatible approach"""
-    # Start a transaction
-    cursor.execute("START TRANSACTION")
-
-    try:
-        # Select and mark rows in one transaction
-        cursor.execute(f"""
-            SELECT {primary_key}
-            FROM temp_batch_keys
-            WHERE processed = false AND worker_id IS NULL
-            LIMIT {batch_size}
-        """)
-        rows = cursor.fetchall()
-
-        if not rows:
-            cursor.execute("COMMIT")
-            return []
-
-        ids = [row[primary_key] for row in rows]
-
-        # Mark these rows as claimed by this worker
-        id_list = ','.join(map(str, ids))
-        cursor.execute(f"""
-            UPDATE temp_batch_keys
-            SET processed = true, worker_id = {worker_id}
-            WHERE {primary_key} IN ({id_list})
-        """)
-
-        # Commit the transaction
-        cursor.execute("COMMIT")
-        return ids
-
-    except Exception as e:
-        # Rollback on error
-        cursor.execute("ROLLBACK")
-        print(f"Error in get_next_batch: {e}")
-        return []
-
-def process_parallel_batches(
-    cursor,
-    action: str,
-    table: str,
-    set_: Optional[str],
-    primary_key: str,
-    batch_size: int,
-    sleep: float,
-    max_workers: int
-):
-    """Process batches in parallel using ThreadPoolExecutor"""
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        while True:
-            # Get multiple batches for parallel processing
-            batches = []
-            for worker_id in range(max_workers):
-                batch = get_next_batch(cursor, primary_key, batch_size, worker_id)
-                if not batch:
-                    break
-                batches.append((batch, worker_id))
-
-            if not batches:
-                break
-
-            # Submit batch jobs
-            futures = []
-            for batch, worker_id in batches:
-                if action == 'delete':
-                    future = executor.submit(delete_batch, batch, table, sleep, primary_key, worker_id)
-                else:
-                    future = executor.submit(update_batch, batch, table, set_, sleep, primary_key, worker_id)
-                futures.append(future)
-
-            # Wait for all batches to complete
-            for future in futures:
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"Error processing batch: {e}")
 
 def main():
     # Parse arguments
