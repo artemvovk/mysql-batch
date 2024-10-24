@@ -191,8 +191,6 @@ def delete_batch(ids: List[int], table: str, sleep: float, primary_key: str, wor
 
     with connection.cursor() as cursor:
         sql = f"DELETE FROM {table} WHERE {primary_key} IN ({','.join(map(str, ids))})"
-        if not confirmed_write:
-            confirm_write(sql)
         cursor.execute(sql)
         connection.commit()
 
@@ -207,8 +205,6 @@ def update_batch(ids: List[int], table: str, set_: str, sleep: float, primary_ke
 
     with connection.cursor() as cursor:
         sql = f"UPDATE {table} SET {set_} WHERE {primary_key} IN ({','.join(map(str, ids))})"
-        if not confirmed_write:
-            confirm_write(sql)
         cursor.execute(sql)
         connection.commit()
 
