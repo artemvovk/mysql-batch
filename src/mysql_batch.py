@@ -142,7 +142,7 @@ def populate_temp_table(cursor, table: str, where: str, primary_key: str, batch_
         SELECT {primary_key}
         FROM {table}
         WHERE {where}
-        LIMIT 1000000
+        LIMIT {read_batch_size}
     """)
 
     rows_inserted = cursor.rowcount
