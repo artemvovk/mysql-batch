@@ -13,66 +13,33 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
-def update_batch(ids, table, set_, sleep=0, primary_key='id'):
-    """
-        Update a batch of rows
-    """
+def delete_batch(ids: List[int], table: str, sleep: float, primary_key: str, worker_id: int):
+    """Execute delete batch"""
+    global connection, confirmed_write
 
-    global confirmed_write
+    print(f"Worker {worker_id}: Deleting batch of {len(ids)} records")
 
-    # Leave if ids is empty
-    if not ids or len(ids) == 0:
-        return None
+    with connection.cursor() as cursor:
+        sql = f"DELETE FROM {table} WHERE {primary_key} IN ({','.join(map(str, ids))})"
+        cursor.execute(sql)
+        connection.commit()
 
-    # Prepare update
-    print('* Updating %i rows...' % len(ids))
-    sql = "UPDATE " + table + " SET " + set_ + \
-        " WHERE {0} IN (".format(primary_key) + \
-        ', '.join([str(x) for x in ids]) + ")"
-    print("   query: " + sql)
+        if sleep > 0:
+            time.sleep(sleep)
 
-    if confirmed_write or query_yes_no("* Start updating?"):
-        # Switch confirmed_write skip the question for the next update
-        confirmed_write = True
+def update_batch(ids: List[int], table: str, set_: str, sleep: float, primary_key: str, worker_id: int):
+    """Execute update batch"""
+    global connection, confirmed_write
 
-        # Execute query
-        run_query(sql, sleep)
-    else:  # answered "no"
-        print("Error: Update declined.")
-        sys.exit()
+    print(f"Worker {worker_id}: Updating batch of {len(ids)} records")
 
-    return True
+    with connection.cursor() as cursor:
+        sql = f"UPDATE {table} SET {set_} WHERE {primary_key} IN ({','.join(map(str, ids))})"
+        cursor.execute(sql)
+        connection.commit()
 
-
-def delete_batch(ids, table, sleep=0, primary_key='id'):
-    """
-        Delete a batch of rows
-    """
-
-    global confirmed_write
-
-    # Leave if ids is empty
-    if not ids or len(ids) == 0:
-        return None
-
-    # Prepare delete
-    print('* Deleting %i rows...' % len(ids))
-    sql = "DELETE FROM " + table + \
-        " WHERE {0} IN (".format(primary_key) + \
-        ', '.join([str(x) for x in ids]) + ")"
-    print("   query: " + sql)
-
-    if confirmed_write or query_yes_no("* Start deleting?"):
-        # Switch confirmed_write skip the question for the next delete
-        confirmed_write = True
-
-        # Execute query
-        run_query(sql, sleep)
-    else:  # answered "no"
-        print("Error: Delete declined.")
-        sys.exit()
-
-    return True
+        if sleep > 0:
+            time.sleep(sleep)
 
 
 def run_query(sql, sleep=0):
