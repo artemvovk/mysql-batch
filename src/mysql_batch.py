@@ -104,6 +104,7 @@ def populate_temp_table(cursor, table: str, where: str, primary_key: str, batch_
         LIMIT {batch_size}
     """)
 
+    total_inserted = 0
     rows_inserted = cursor.rowcount
 
     total_inserted += rows_inserted
