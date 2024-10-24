@@ -151,7 +151,6 @@ def populate_temp_table(cursor, table: str, where: str, primary_key: str, batch_
     print(f"* Inserted batch: {rows_inserted} rows (Total: {total_inserted})")
 
     connection.commit()
-    offset += batch_size
 
 def get_next_batch(connection, primary_key: str, batch_size: int, worker_id: int) -> List[int]:
     """Get next batch of unprocessed IDs using MySQL-compatible approach"""
