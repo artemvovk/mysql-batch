@@ -124,8 +124,7 @@ def connect(host, user, port, password, database):
                                password=password,
                                db=database,
                                charset='utf8mb4',
-                               client_flag=pymysql.constants.CLIENT.MULTI_STATEMENTS,
-                               cursorclass=pymysql.cursors.DictCursor)
+                               client_flag=pymysql.constants.CLIENT.MULTI_STATEMENTS)
     except Exception:
         raise RuntimeError('Error: MySQL connection failed.')
 
