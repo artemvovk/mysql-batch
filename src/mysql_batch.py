@@ -5,6 +5,7 @@
 # Compatible with python 2.7 & 3
 
 import sys
+import threading
 import time
 import pymysql.cursors
 import pymysql.constants.CLIENT
@@ -162,7 +163,6 @@ def connect(host, user, port, password, database):
         raise RuntimeError('Error: MySQL connection failed.')
 
 
-
 def execute(
     host: str,
     user: str,
@@ -241,6 +241,9 @@ def execute(
     except SystemExit:
         print("* Program exited")
     finally:
+        # Drop temporary table
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TEMPORARY TABLE IF EXISTS temp_batch_keys")
         connection.close()
 
     return True
@@ -251,7 +254,9 @@ def create_temp_table(cursor, primary_key: str):
     cursor.execute(f"""
         CREATE TEMPORARY TABLE temp_batch_keys (
             {primary_key} bigint PRIMARY KEY,
-            processed boolean DEFAULT false
+            processed boolean DEFAULT false,
+            worker_id int DEFAULT NULL,
+            INDEX (processed, worker_id)
         )
     """)
 
@@ -261,23 +266,48 @@ def populate_temp_table(cursor, table: str, where: str, primary_key: str, batch_
     cursor.execute(f"""
         INSERT INTO temp_batch_keys ({primary_key})
         SELECT {primary_key} FROM {table}
-        WHERE {where} LIMIT {batch_size}
+        WHERE {where}
     """)
+    connection.commit()
 
-def get_next_batch(cursor, primary_key: str, batch_size: int) -> List[int]:
-    """Get next batch of unprocessed IDs"""
-    cursor.execute(f"""
-        UPDATE temp_batch_keys
-        SET processed = true
-        WHERE {primary_key} IN (
+def get_next_batch(cursor, primary_key: str, batch_size: int, worker_id: int) -> List[int]:
+    """Get next batch of unprocessed IDs using MySQL-compatible approach"""
+    # Start a transaction
+    cursor.execute("START TRANSACTION")
+
+    try:
+        # Select and mark rows in one transaction
+        cursor.execute(f"""
             SELECT {primary_key}
             FROM temp_batch_keys
-            WHERE processed = false
+            WHERE processed = false AND worker_id IS NULL
             LIMIT {batch_size}
-        )
-        RETURNING {primary_key}
-    """)
-    return [row[primary_key] for row in cursor.fetchall()]
+        """)
+        rows = cursor.fetchall()
+
+        if not rows:
+            cursor.execute("COMMIT")
+            return []
+
+        ids = [row[primary_key] for row in rows]
+
+        # Mark these rows as claimed by this worker
+        id_list = ','.join(map(str, ids))
+        cursor.execute(f"""
+            UPDATE temp_batch_keys
+            SET processed = true, worker_id = {worker_id}
+            WHERE {primary_key} IN ({id_list})
+        """)
+
+        # Commit the transaction
+        cursor.execute("COMMIT")
+        return ids
+
+    except Exception as e:
+        # Rollback on error
+        cursor.execute("ROLLBACK")
+        print(f"Error in get_next_batch: {e}")
+        return []
 
 def process_parallel_batches(
     cursor,
@@ -294,27 +324,30 @@ def process_parallel_batches(
         while True:
             # Get multiple batches for parallel processing
             batches = []
-            for _ in range(max_workers):
-                batch = get_next_batch(cursor, primary_key, batch_size)
+            for worker_id in range(max_workers):
+                batch = get_next_batch(cursor, primary_key, batch_size, worker_id)
                 if not batch:
                     break
-                batches.append(batch)
+                batches.append((batch, worker_id))
 
             if not batches:
                 break
 
             # Submit batch jobs
             futures = []
-            for batch in batches:
+            for batch, worker_id in batches:
                 if action == 'delete':
-                    future = executor.submit(delete_batch, batch, table, sleep, primary_key)
+                    future = executor.submit(delete_batch, batch, table, sleep, primary_key, worker_id)
                 else:
-                    future = executor.submit(update_batch, batch, table, set_, sleep, primary_key)
+                    future = executor.submit(update_batch, batch, table, set_, sleep, primary_key, worker_id)
                 futures.append(future)
 
             # Wait for all batches to complete
             for future in futures:
-                future.result()
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error processing batch: {e}")
 
 def main():
     # Parse arguments
