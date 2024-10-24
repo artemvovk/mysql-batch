@@ -111,7 +111,7 @@ def populate_temp_table(cursor, table: str, where: str, primary_key: str, batch_
         """)
 
         rows_inserted = cursor.rowcount
-        if rows_inserted == 0:
+        if rows_inserted == 0 or total_inserted >= 100000000:
             break
 
         total_inserted += rows_inserted
